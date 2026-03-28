@@ -11,5 +11,7 @@
 vivado*.log
 vivado*.jou
 vivado*.str
+*.vcd
 project/
+.verilator/
 .Xil/
