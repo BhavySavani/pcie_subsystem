@@ -18,7 +18,7 @@ module tb_cq_parser();
     // 3. Outputs
     cq_tlp_t      tlp;
     logic         tlp_enable;
-
+    logic [63:0] s_axis_cq_keep;
     
     cq_parser_non_straddle dut (
         .s_axis_cq_data(s_axis_cq_data),
@@ -33,71 +33,130 @@ module tb_cq_parser();
 
     
     initial begin
-        clk = 0;
-        forever #2 clk = ~clk; 
-    end
+    clk = 0;
+    forever #2 clk = ~clk;
+end
 
     // 6. Stimulus Variables
     cq_mem_descriptor_t my_desc;
     cq_user_t           my_user;
 
-    // 7. Test Sequence
+   
+    // Task: Send an AXI-Stream Beat
+    task send_beat(input logic [511:0] data, input logic [63:0] keep, input logic last, input logic discontinue = 0);
+        s_axis_cq_valid = 1'b1;
+        s_axis_cq_data  = data;
+        s_axis_cq_keep  = keep; 
+        s_axis_cq_last  = last;
+        
+        s_axis_cq_user  = '0; 
+        if (discontinue) s_axis_cq_user[41] = 1'b1; 
+
+        @(posedge clk);
+
+        s_axis_cq_valid = 1'b0;
+    endtask
+
+    
     initial begin
-        $dumpfile("waveform_cq.vcd");
-        $dumpvars(0, tb_cq_parser);
-        // Initialize
+
         areset = 1;
         s_axis_cq_valid = 0;
-        s_axis_cq_last = 0;
-        s_axis_cq_data = '0;
-        s_axis_cq_user = '0;
-
-        // Release reset
         #20 areset = 0;
         #20;
         @(posedge clk);
 
-        //Test : Single-DWORD Memory Write
+        $display(">>> Starting CQ Parser Verification Suite...");
+
+        // ---------------------------------------------------------
+        // TEST 1: Mem Read (128b Descriptor, 0b Payload)
+        // 128 bits = 16 bytes. TKEEP = 0x0000_0000_0000_FFFF
+        // ---------------------------------------------------------
+        $display("Test 1: Mem Read (0b Payload)");
+        send_beat(
+            {384'h0, 128'h00000000_00001000_00000000_40000000}, // Simulated Descriptor
+            64'h0000_0000_0000_FFFF, 
+            1'b1 
+        );
+        #20;
+
+        // ---------------------------------------------------------
+        // TEST 2: Mem Write (128b Descriptor, 32b Payload)
+        // 160 bits = 20 bytes. TKEEP = 0x0000_0000_000F_FFFF
+        // ---------------------------------------------------------
+        $display("Test 2: Mem Write (32b Payload)");
+        send_beat(
+            {352'h0, 32'hDEADBEEF, 128'h00000000_00001000_00000000_40000001}, 
+            64'h0000_0000_000F_FFFF, 
+            1'b1 
+        );
+        #20;
+
+        // ---------------------------------------------------------
+        // TEST 3: Mem Write (128b Descriptor, 384b Payload)
+        // 512 bits = 64 bytes. TKEEP = 0xFFFF_FFFF_FFFF_FFFF (All 1s)
+        // Fits perfectly in exactly one beat!
+        // ---------------------------------------------------------
+        $display("Test 3: Mem Write (384b Payload - 1 Beat Exact)");
+        send_beat(
+            {{12{32'hAAAA_BBBB}}, 128'h00000000_00001000_00000000_4000000C}, 
+            64'hFFFF_FFFF_FFFF_FFFF, 
+            1'b1 
+        );
+        #20;
+
+        // ---------------------------------------------------------
+        // TEST 4: Mem Write (128b Descriptor, 416b Payload)
+        // Spills over into a second beat!
+        // ---------------------------------------------------------
+        $display("Test 4: Mem Write (416b Payload - 2 Beats)");
+        // Beat 1: Descriptor + First 384 bits of payload
+        send_beat(
+            {{12{32'h1111_2222}}, 128'h00000000_00001000_00000000_4000000D}, 
+            64'hFFFF_FFFF_FFFF_FFFF, 
+            1'b0 
+        );
+        // Remaining 32 bits of payload (4 bytes -> TKEEP = 0xF)
+        send_beat(
+            {480'h0, 32'h3333_4444}, 
+            64'h0000_0000_0000_000F, 
+            1'b1 
+        );
+        #20;
+
+        // ---------------------------------------------------------
+        // TEST 5: Mem Write (128b Descriptor, 8192b Payload)
+        // 8192 bits = 1024 bytes (256 DWORDs).
+        // Requires 17 total beats.
+        // ---------------------------------------------------------
+        $display("Test 5: Mem Write Burst (8192b Payload - 17 Beats)");
+        // Beat 1: Descriptor + First 384 bits
+        send_beat({ {12{32'hFACE_FEED}}, 128'h00000000_00001000_00000000_40000100}, 64'hFFFF_FFFF_FFFF_FFFF, 1'b0);
         
-        // A. Build the Descriptor
-        my_desc = '0; // Clear all fields
-        my_desc.request_type = REQUEST_MEM_WRITE;
-        my_desc.address_type = ADDRESS_TYPE_UNTRANSLATED;
-        my_desc.address      = 62'h0000_0000_0000_0400; // Target Address: 0x1000
-        my_desc.dword_count  = 11'd1;                   // 1 DWORD (4 bytes) of payload
-        my_desc.requester_id = 16'h0100;                // Bus 1, Dev 0, Func 0
-        my_desc.tag          = 8'hAA;                   // Arbitrary transaction tag
-
-        // B. Build the User (Sideband) Signals
-        my_user = '0;
-        my_user.first_be      = 8'h0F;  // All 4 bytes of the first payload DWORD are valid
-        my_user.last_be       = 8'h00;  // Single DWORD payload, so last_be is 0
-        my_user.is_sop        = 2'b01;  // Start of Packet on bit 0 of the bus
-        my_user.is_eop        = 2'b01;  // End of Packet on this beat
+        // Beats 2 to 16: 512 bits of pure payload per beat
+        for (int i = 0; i < 15; i++) begin
+            send_beat({16{32'hCAFE_BABE}}, 64'hFFFF_FFFF_FFFF_FFFF, 1'b0);
+        end
         
-        // The descriptor takes up DWORDS 0, 1, 2, and 3 (128 bits).
-        // Our 1 DWORD payload sits at DWORD 4.
-        my_user.is_eop_ptr[0] = 4'd4;   // Tell the core the packet ends at DWORD 4
+        // Beat 17: Final 128 bits of payload (16 bytes -> TKEEP = 0xFFFF)
+        send_beat({384'h0, {4{32'hBEEF_CAFE}}}, 64'h0000_0000_0000_FFFF, 1'b1);
+        #20;
 
-        // C. Pack everything onto the 512-bit bus
-        s_axis_cq_valid = 1'b1;
-        s_axis_cq_last  = 1'b1;         // Entire packet fits in one 512-bit cycle
-        s_axis_cq_user  = my_user;
-        
-        s_axis_cq_data[127:0]   = my_desc;      // 128-bit header goes in the LSBs
-        s_axis_cq_data[159:128] = 32'hDEADBEEF; // 32-bit Payload goes right after
-
-        // Drive for one clock cycle
-        @(posedge clk);
-        s_axis_cq_valid = 1'b0;
-        s_axis_cq_last  = 1'b0;
-        s_axis_cq_data  = '0;
-
-        // Wait a few cycles to observe the output
+        // ---------------------------------------------------------
+        // TEST 6: Discontinue Assertion (TLP Drop)
+        // Simulating a corrupted packet that the host aborts mid-flight.
+        // ---------------------------------------------------------
+        $display("Test 6: Discontinue Packet (TLP Drop)");
+        send_beat(
+            {352'h0, 32'hBAD0_BAD0, 128'h00000000_00001000_00000000_40000001}, 
+            64'h0000_0000_000F_FFFF, 
+            1'b1, 
+            1'b1 // Set discontinue flag!
+        );
         #50;
-        
-        $display("Simulation Complete.");
+
+        $display(">>> CQ Parser Verification Suite Complete!");
         $finish;
     end
 
-endmodule
+endmodule: tb_cq_parser
