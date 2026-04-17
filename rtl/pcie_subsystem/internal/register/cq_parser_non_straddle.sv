@@ -42,7 +42,7 @@ module cq_parser_non_straddle (
     end
   end
 
-  function automatic logic [8708:0] parse_for_continue(
+function automatic logic [8708:0] parse_for_continue(
     input continue_t    now_continue,
     input logic [511:0] data,
     input logic         last
@@ -50,6 +50,8 @@ module cq_parser_non_straddle (
     continue_t next_continue = '0;
 
     if (!last) begin
+      // Fix : Preserve previously accumulated payload data
+      next_continue.data = now_continue.data;                       
       next_continue.data[now_continue.index * 512 +: 512] = data;
       next_continue.index = now_continue.index + 1;
     end
